@@ -545,7 +545,7 @@ func (s *managerTestSuite) TestRemoteNodeIdentities(c *check.C) {
 	}
 }
 
-func (s *managerTestSuite) TestNodeEncryption(c *check.C) {
+func (s *managerTestSuite) TestEncryption(c *check.C) {
 	ipcacheMock := newIPcacheMock()
 	mngr, err := NewManager("test", newSignalNodeHandler(), ipcacheMock, &configMock{NodeEncryption: true})
 	c.Assert(err, check.IsNil)

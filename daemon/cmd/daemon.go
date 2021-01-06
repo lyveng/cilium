@@ -79,7 +79,6 @@ import (
 	"github.com/cilium/cilium/pkg/rate"
 	"github.com/cilium/cilium/pkg/redirectpolicy"
 	"github.com/cilium/cilium/pkg/service"
-	serviceStore "github.com/cilium/cilium/pkg/service/store"
 	"github.com/cilium/cilium/pkg/sockops"
 	"github.com/cilium/cilium/pkg/status"
 	"github.com/cilium/cilium/pkg/trigger"
@@ -492,6 +491,23 @@ func NewDaemon(ctx context.Context, epMgr *endpointmanager.EndpointManager, dp d
 		bootstrapStats.k8sInit.End(true)
 	}
 
+	if option.Config.JoinCluster {
+		if k8s.IsEnabled() {
+			log.Fatalf("Cannot join a Cilium cluster (--%s) when configured as a Kubernetes node", option.JoinClusterName)
+		}
+		if option.Config.KVStore == "" {
+			log.Fatalf("Joining a Cilium cluster (--%s) requires kvstore (--%s) be set", option.JoinClusterName, option.KVStore)
+		}
+		agentLabels := labels.NewLabelsFromModel(option.Config.AgentLabels).K8sStringMap()
+		if option.Config.K8sNamespace != "" {
+			agentLabels[k8sConst.PodNamespaceLabel] = option.Config.K8sNamespace
+		}
+		agentLabels[k8sConst.PodNameLabel] = nodeTypes.GetName()
+		agentLabels[k8sConst.PolicyLabelCluster] = option.Config.ClusterName
+		// Set configured agent labels to local node for node registration
+		node.SetLabels(agentLabels)
+	}
+
 	// Perform an early probe on the underlying kernel on whether BandwidthManager
 	// can be supported or not. This needs to be done before handleNativeDevices()
 	// as BandwidthManager needs these to be available for setup.
@@ -575,44 +591,7 @@ func NewDaemon(ctx context.Context, epMgr *endpointmanager.EndpointManager, dp d
 		log.WithError(err).Warning("Unable to clean stale endpoint interfaces")
 	}
 
-	// Must init kvstore before starting node discovery
-	if option.Config.KVStore == "" {
-		log.Info("Skipping kvstore configuration")
-	} else {
-		bootstrapStats.kvstore.Start()
-		d.initKVStore()
-		bootstrapStats.kvstore.End(true)
-	}
-
-	// Configure IPAM without using the configuration yet.
-	d.configureIPAM()
-
-	if option.Config.JoinCluster {
-		if k8s.IsEnabled() {
-			log.Fatalf("Cannot join a Cilium cluster (--%s) when configured as a Kubernetes node", option.JoinClusterName)
-		}
-		if option.Config.KVStore == "" {
-			log.Fatalf("Joining a Cilium cluster (--%s) requires kvstore (--%s) be set", option.JoinClusterName, option.KVStore)
-		}
-		agentLabels := labels.NewLabelsFromModel(option.Config.AgentLabels).K8sStringMap()
-		if option.Config.K8sNamespace != "" {
-			agentLabels[k8sConst.PodNamespaceLabel] = option.Config.K8sNamespace
-		}
-		agentLabels[k8sConst.PodNameLabel] = nodeTypes.GetName()
-		agentLabels[k8sConst.PolicyLabelCluster] = option.Config.ClusterName
-		// Set configured agent labels to local node for node registration
-		node.SetLabels(agentLabels)
-
-		// This can override node addressing config, so do this before starting IPAM
-		log.WithField(logfields.NodeName, nodeTypes.GetName()).Debug("Calling JoinCluster()")
-		d.nodeDiscovery.JoinCluster(nodeTypes.GetName())
-
-		// Start services watcher
-		serviceStore.JoinClusterServices(&d.k8sWatcher.K8sSvcCache)
-	}
-
-	// Start IPAM
-	d.startIPAM()
+	d.bootstrapIPAM()
 
 	// restore endpoints before any IPs are allocated to avoid eventual IP
 	// conflicts later on, otherwise any IP conflict will result in the
@@ -626,9 +605,6 @@ func NewDaemon(ctx context.Context, epMgr *endpointmanager.EndpointManager, dp d
 	if err := d.allocateIPs(); err != nil {
 		return nil, nil, err
 	}
-
-	// Must occur after d.allocateIPs(), see GH-14245 and its fix.
-	d.nodeDiscovery.StartDiscovery(nodeTypes.GetName())
 
 	// Annotation of the k8s node must happen after discovery of the
 	// PodCIDR range and allocation of the health IPs.
@@ -655,6 +631,17 @@ func NewDaemon(ctx context.Context, epMgr *endpointmanager.EndpointManager, dp d
 	} else if !option.Config.AnnotateK8sNode {
 		log.Debug("Annotate k8s node is disabled.")
 	}
+
+	// Must init kvstore before starting node discovery
+	if option.Config.KVStore == "" {
+		log.Info("Skipping kvstore configuration")
+	} else {
+		bootstrapStats.kvstore.Start()
+		d.initKVStore()
+		bootstrapStats.kvstore.End(true)
+	}
+
+	d.nodeDiscovery.StartDiscovery(nodeTypes.GetName())
 
 	// Trigger refresh and update custom resource in the apiserver with all restored endpoints.
 	// Trigger after nodeDiscovery.StartDiscovery to avoid custom resource update conflict.

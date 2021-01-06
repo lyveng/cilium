@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cilium/cilium/pkg/defaults"
+	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
@@ -35,12 +36,6 @@ var (
 	// break backwards compatibility
 	NodeStorePrefix = path.Join(kvstore.BaseKeyPrefix, "state", "nodes", "v1")
 
-	// KeyCreator creates a node for a shared store
-	KeyCreator = func() store.Key {
-		n := nodeTypes.Node{}
-		return &n
-	}
-
 	// NodeRegisterStorePrefix is the kvstore prefix of the shared
 	// store for node registration
 	//
@@ -48,9 +43,9 @@ var (
 	// break backwards compatibility
 	NodeRegisterStorePrefix = path.Join(kvstore.BaseKeyPrefix, "state", "noderegister", "v1")
 
-	// RegisterKeyCreator creates a node for a shared store
-	RegisterKeyCreator = func() store.Key {
-		n := nodeTypes.RegisterNode{}
+	// KeyCreator creates a node for a shared store
+	KeyCreator = func() store.Key {
+		n := nodeTypes.Node{}
 		return &n
 	}
 )
@@ -106,83 +101,34 @@ type NodeRegistrar struct {
 // RegisterObserver implements the store.Observer interface and sends
 // named node's identity updates on a channel.
 type RegisterObserver struct {
-	name    string
-	updates chan *nodeTypes.RegisterNode
+	name   string
+	idChan chan uint32
 }
 
 // NewRegisterObserver returns a new RegisterObserver
-func NewRegisterObserver(name string, updateChan chan *nodeTypes.RegisterNode) *RegisterObserver {
+func NewRegisterObserver(name string, idChan chan uint32) *RegisterObserver {
 	return &RegisterObserver{
-		name:    name,
-		updates: updateChan,
+		name:   name,
+		idChan: idChan,
 	}
 }
 
 func (o *RegisterObserver) OnUpdate(k store.Key) {
-	if n, ok := k.(*nodeTypes.RegisterNode); ok {
-		log.Debugf("noderegister update on key %s while waiting for %s: %v", n.GetKeyName(), o.name, n)
-		if n.NodeIdentity != 0 && n.GetKeyName() == o.name {
+	if n, ok := k.(*nodeTypes.Node); ok {
+		if n.NodeIdentity != 0 && n.Fullname() == o.name {
 			select {
-			case o.updates <- n:
+			case o.idChan <- n.NodeIdentity:
 			default:
-				// Register Node updateChan would block, not sending
+				// Register Node idChan would block, not sending
 			}
 		}
 	}
 }
 
 func (o *RegisterObserver) OnDelete(k store.NamedKey) {
-	log.Debugf("noderegister key %s deleted while registering %s", k.GetKeyName(), o.name)
 }
 
-// JoinCluster registers the local node in the cluster.
-// Blocks until timeout occurs or an updated Node is received from the kv-store and returns it.
-// Otherwise this does not block and returns nil.
-func (nr *NodeRegistrar) JoinCluster(name string) (*nodeTypes.Node, error) {
-	n := &nodeTypes.RegisterNode{
-		Node: nodeTypes.Node{
-			Name:   name,
-			Source: source.Local,
-		},
-	}
-
-	registerObserver := NewRegisterObserver(n.GetKeyName(), make(chan *nodeTypes.RegisterNode, 10))
-	// Join the shared store for node registrations
-	registerStore, err := store.JoinSharedStore(store.Configuration{
-		Prefix:     NodeRegisterStorePrefix,
-		KeyCreator: RegisterKeyCreator,
-		Observer:   registerObserver,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// Drain the channel of old updates first
-	for len(registerObserver.updates) > 0 {
-		dump := <-registerObserver.updates
-		log.Debugf("bypassing stale noderegister key: %s", dump.GetKeyName())
-	}
-
-	log.Debugf("updating noderegister key %s with: %v", n.GetKeyName(), n)
-	err = registerStore.UpdateLocalKeySync(context.TODO(), n)
-	if err != nil {
-		registerStore.Release()
-		return nil, err
-	}
-
-	// Wait until an updated key is received from the kvstore
-	select {
-	case n = <-registerObserver.updates:
-	case <-time.After(defaults.NodeInitTimeout / 10):
-		registerStore.Release()
-		return nil, fmt.Errorf("timed out waiting for node identity")
-	}
-
-	nr.registerStore = registerStore
-	return &n.Node, nil
-}
-
-// RegisterNode registers the local node in the cluster.
+// RegisterNode registers the local node in the cluster
 func (nr *NodeRegistrar) RegisterNode(n *nodeTypes.Node, manager NodeManager) error {
 	if option.Config.KVStore == "" {
 		return nil
@@ -194,22 +140,58 @@ func (nr *NodeRegistrar) RegisterNode(n *nodeTypes.Node, manager NodeManager) er
 		KeyCreator: KeyCreator,
 		Observer:   NewNodeObserver(manager),
 	})
+
 	if err != nil {
 		return err
 	}
 
-	// Use nodeTypes.RegisterNode for updating local node info if not nil, but keep nodeStore for cluster node updates
-	if nr.registerStore != nil {
-		err = nr.registerStore.UpdateLocalKeySync(context.TODO(), &nodeTypes.RegisterNode{Node: *n})
+	var registerStore *store.SharedStore
+	if option.Config.JoinCluster {
+		nodeId := make(chan uint32, 1)
+
+		// Join the shared store for node registrations
+		registerStore, err := store.JoinSharedStore(store.Configuration{
+			Prefix:     NodeRegisterStorePrefix,
+			KeyCreator: KeyCreator,
+			Observer:   NewRegisterObserver(n.Fullname(), nodeId),
+		})
+		if err != nil {
+			nodeStore.Release()
+			return err
+		}
+
+		// drain the channel of old updates first
+		for len(nodeId) > 0 {
+			<-nodeId
+		}
+		err = registerStore.UpdateLocalKeySync(context.TODO(), n)
+		if err == nil {
+			// Wait until node identity can has been allocated by the KV store
+			select {
+			case id := <-nodeId:
+				n.NodeIdentity = id
+				identity.SetLocalNodeID(id)
+			case <-time.After(defaults.NodeInitTimeout / 10):
+				registerStore.Release()
+				nodeStore.Release()
+				return fmt.Errorf("timed out waiting for node identity")
+			}
+		}
 	} else {
 		err = nodeStore.UpdateLocalKeySync(context.TODO(), n)
 	}
+
 	if err != nil {
+		if registerStore != nil {
+			registerStore.Release()
+		}
 		nodeStore.Release()
 		return err
 	}
 
+	nr.registerStore = registerStore
 	nr.SharedStore = nodeStore
+
 	return nil
 }
 
@@ -217,7 +199,7 @@ func (nr *NodeRegistrar) RegisterNode(n *nodeTypes.Node, manager NodeManager) er
 // SharedStore.
 func (nr *NodeRegistrar) UpdateLocalKeySync(n *nodeTypes.Node) error {
 	if nr.registerStore != nil {
-		return nr.registerStore.UpdateLocalKeySync(context.TODO(), &nodeTypes.RegisterNode{Node: *n})
+		return nr.registerStore.UpdateLocalKeySync(context.TODO(), n)
 	}
 	return nr.SharedStore.UpdateLocalKeySync(context.TODO(), n)
 }
